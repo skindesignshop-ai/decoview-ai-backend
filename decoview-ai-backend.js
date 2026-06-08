@@ -1,22 +1,31 @@
 /**
- * DecoView AI - Backend para Gemini (Nano Banana 2)  v2
- * decodesign studio pro
+ * ============================================================
+ *  DecoView AI - Backend para Gemini (Nano Banana)  v4
+ *  decodesign studio pro
+ * ============================================================
+ *  v4: acepta VARIOS muebles (products[]), prueba varios modelos
+ *      y formatos, y devuelve el detalle del error si falla.
+ *      /diag  -> modelos disponibles
  */
 
 const express = require("express");
 const cors = require("cors");
 
 const app = express();
-app.use(express.json({ limit: "25mb" }));
+app.use(express.json({ limit: "40mb" }));
 app.use(cors({ origin: "*" }));
 
 const API_KEY = process.env.GEMINI_API_KEY;
 
 const MODELS = [
   "gemini-3.1-flash-image",
-  "gemini-3.1-flash-image-preview",
   "gemini-2.5-flash-image",
-  "gemini-2.5-flash-image-preview",
+  "gemini-3-pro-image",
+];
+const CONFIGS = [
+  null,
+  { responseModalities: ["TEXT", "IMAGE"] },
+  { responseModalities: ["IMAGE"] },
 ];
 
 function parseDataUrl(dataUrl) {
@@ -39,12 +48,10 @@ function findImage(data) {
   return null;
 }
 
-async function callModel(model, parts) {
+async function callModel(model, parts, genConfig) {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
-  const body = {
-    contents: [{ role: "user", parts }],
-    generationConfig: { responseModalities: ["TEXT", "IMAGE"] },
-  };
+  const body = { contents: [{ role: "user", parts }] };
+  if (genConfig) body.generationConfig = genConfig;
   const r = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json", "x-goog-api-key": API_KEY },
@@ -58,37 +65,50 @@ async function callModel(model, parts) {
 
 app.post("/generate", async (req, res) => {
   try {
-    if (!API_KEY) return res.status(500).json({ error: "Falta GEMINI_API_KEY en el servidor." });
+    if (!API_KEY) return res.status(500).json({ error: "Falta GEMINI_API_KEY." });
 
-    const { room, product, prompt } = req.body || {};
+    const body = req.body || {};
+    const room = body.room;
+    // acepta products[] (varios) o product (uno solo)
+    let products = Array.isArray(body.products) ? body.products : [];
+    if (!products.length && body.product) products = [body.product];
+
     const roomImg = parseDataUrl(room);
     if (!roomImg) return res.status(400).json({ error: "Falta la foto del ambiente." });
-    const productImg = parseDataUrl(product);
 
+    const prodImgs = products.map(parseDataUrl).filter(Boolean);
+
+    const varios = prodImgs.length > 1;
     const instruction =
       "Sos un motor de edicion de imagenes de interiorismo fotorrealista. " +
       "Toma la PRIMERA imagen (la foto real del ambiente) y agrega dentro, de forma realista, " +
-      "el mueble que aparece en la SEGUNDA imagen. Recorta el mueble de su fondo (que no quede ningun recuadro ni fondo blanco), " +
-      "apoyalo en el piso con la perspectiva correcta del ambiente, escala realista, la misma iluminacion de la escena y sombra de contacto natural. " +
-      "No cambies las paredes, ventanas ni la estructura del ambiente. Devolve la imagen final integrada. " +
-      (prompt ? ("Indicacion del cliente: " + prompt) : "");
+      (varios
+        ? ("TODOS los muebles que aparecen en las " + prodImgs.length + " imagenes siguientes, distribuyendolos de forma armoniosa en el espacio. ")
+        : "el mueble que aparece en la SEGUNDA imagen. ") +
+      "Recorta cada mueble de su fondo (sin recuadro ni fondo blanco), apoyalos en el piso con la perspectiva correcta del ambiente, " +
+      "escala realista, la misma iluminacion de la escena y sombra de contacto natural. " +
+      "No cambies paredes, ventanas ni estructura. Devolve SOLO la imagen final integrada. " +
+      (body.prompt ? ("Indicacion del cliente: " + body.prompt) : "");
 
     const parts = [{ text: instruction }];
     parts.push({ inline_data: { mime_type: roomImg.mimeType, data: roomImg.data } });
-    if (productImg) parts.push({ inline_data: { mime_type: productImg.mimeType, data: productImg.data } });
+    prodImgs.forEach((p) => parts.push({ inline_data: { mime_type: p.mimeType, data: p.data } }));
 
     const attempts = [];
     for (const model of MODELS) {
-      let r;
-      try { r = await callModel(model, parts); }
-      catch (e) { attempts.push({ model, error: String(e) }); continue; }
+      for (const gc of CONFIGS) {
+        let r;
+        try { r = await callModel(model, parts, gc); }
+        catch (e) { attempts.push({ model, error: String(e) }); continue; }
 
-      if (r.ok && r.json) {
-        const img = findImage(r.json);
-        if (img) return res.json({ image: img, model });
-        attempts.push({ model, status: r.status, note: "respondio sin imagen", sample: r.text.slice(0, 300) });
-      } else {
-        attempts.push({ model, status: r.status, sample: r.text.slice(0, 300) });
+        if (r.ok && r.json) {
+          const img = findImage(r.json);
+          if (img) return res.json({ image: img, model });
+          attempts.push({ model, gc: gc ? gc.responseModalities.join("+") : "none", status: r.status, note: "sin imagen", sample: r.text.slice(0, 220) });
+        } else {
+          attempts.push({ model, gc: gc ? gc.responseModalities.join("+") : "none", status: r.status, sample: r.text.slice(0, 220) });
+          if (r.status === 404) break;
+        }
       }
     }
     return res.status(502).json({ error: "Ningun modelo devolvio imagen.", attempts });
@@ -106,14 +126,13 @@ app.get("/diag", async (_req, res) => {
     });
     const data = await r.json();
     const all = (data.models || []).map((m) => m.name);
-    const image = all.filter((n) => /image/i.test(n));
-    res.json({ ok: r.ok, total: all.length, modelos_de_imagen: image, todos: all });
+    res.json({ ok: r.ok, modelos_de_imagen: all.filter((n) => /image/i.test(n)) });
   } catch (e) {
     res.status(500).json({ error: String(e) });
   }
 });
 
-app.get("/", (_req, res) => res.send("DecoView AI backend OK (v2)"));
+app.get("/", (_req, res) => res.send("DecoView AI backend OK (v4)"));
 
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log(`DecoView AI backend v2 escuchando en el puerto ${PORT}`));
+app.listen(PORT, () => console.log(`DecoView AI backend v4 escuchando en el puerto ${PORT}`));
