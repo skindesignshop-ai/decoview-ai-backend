@@ -1,11 +1,11 @@
 /**
  * ============================================================
- *  DecoView AI - Backend para Gemini (Nano Banana)  v4
+ *  DecoView AI - Backend para Gemini (Nano Banana)  v6
  *  decodesign studio pro
  * ============================================================
- *  v4: acepta VARIOS muebles (products[]), prueba varios modelos
- *      y formatos, y devuelve el detalle del error si falla.
- *      /diag  -> modelos disponibles
+ *  v6: DOS MODOS en un solo backend.
+ *      mode = "exacto"      -> pone SOLO los muebles dados (Con mis muebles)
+ *      mode = "inspiracion" -> ambienta y propone decoracion (Ideas)
  */
 
 const express = require("express");
@@ -63,13 +63,51 @@ async function callModel(model, parts, genConfig) {
   return { ok: r.ok, status: r.status, json, text };
 }
 
+function buildInstruction(mode, count, prompt) {
+  const varios = count > 1;
+  const base =
+    "Sos un motor de edicion de imagenes de interiorismo fotorrealista. " +
+    "Toma la PRIMERA imagen (la foto real del ambiente). ";
+
+  let core;
+  if (mode === "inspiracion") {
+    core =
+      "Agrega dentro " +
+      (varios
+        ? ("los " + count + " muebles que aparecen en las imagenes siguientes ")
+        : "el mueble que aparece en la SEGUNDA imagen ") +
+      "y, ademas, AMBIENTA el espacio como un disenador de interiores profesional: " +
+      "podes sumar decoracion complementaria sutil y armoniosa (alfombra, planta, iluminacion, cuadros, textiles) " +
+      "que combine con el estilo, para mostrar una propuesta de decoracion completa e inspiradora. ";
+  } else {
+    core =
+      "Agrega dentro, de forma realista, " +
+      (varios
+        ? ("UNICAMENTE los " + count + " muebles que aparecen en las imagenes siguientes (uno por cada imagen), distribuyendolos de forma armoniosa. ")
+        : "UNICAMENTE el mueble que aparece en la SEGUNDA imagen. ") +
+      "REGLA IMPORTANTE: NO agregues, inventes ni sumes NINGUN otro mueble, objeto, alfombra, planta, mesa ni decoracion que no este en las imagenes provistas. " +
+      "Coloca exactamente los muebles dados, ni mas ni menos. ";
+  }
+
+  const common =
+    "Recorta cada mueble de su fondo (sin recuadro ni fondo blanco), apoyalos en el piso con la perspectiva correcta del ambiente, " +
+    "escala realista, la misma iluminacion de la escena y sombra de contacto natural. " +
+    "No cambies paredes, ventanas, piso ni estructura del ambiente. Devolve SOLO la imagen final integrada. ";
+
+  const userPrompt = prompt
+    ? ("Indicacion de ubicacion del cliente (respetala): " + prompt)
+    : "";
+
+  return base + core + common + userPrompt;
+}
+
 app.post("/generate", async (req, res) => {
   try {
     if (!API_KEY) return res.status(500).json({ error: "Falta GEMINI_API_KEY." });
 
     const body = req.body || {};
     const room = body.room;
-    // acepta products[] (varios) o product (uno solo)
+    const mode = body.mode === "inspiracion" ? "inspiracion" : "exacto";
     let products = Array.isArray(body.products) ? body.products : [];
     if (!products.length && body.product) products = [body.product];
 
@@ -78,17 +116,7 @@ app.post("/generate", async (req, res) => {
 
     const prodImgs = products.map(parseDataUrl).filter(Boolean);
 
-    const varios = prodImgs.length > 1;
-    const instruction =
-      "Sos un motor de edicion de imagenes de interiorismo fotorrealista. " +
-      "Toma la PRIMERA imagen (la foto real del ambiente) y agrega dentro, de forma realista, " +
-      (varios
-        ? ("TODOS los muebles que aparecen en las " + prodImgs.length + " imagenes siguientes, distribuyendolos de forma armoniosa en el espacio. ")
-        : "el mueble que aparece en la SEGUNDA imagen. ") +
-      "Recorta cada mueble de su fondo (sin recuadro ni fondo blanco), apoyalos en el piso con la perspectiva correcta del ambiente, " +
-      "escala realista, la misma iluminacion de la escena y sombra de contacto natural. " +
-      "No cambies paredes, ventanas ni estructura. Devolve SOLO la imagen final integrada. " +
-      (body.prompt ? ("Indicacion del cliente: " + body.prompt) : "");
+    const instruction = buildInstruction(mode, prodImgs.length, body.prompt);
 
     const parts = [{ text: instruction }];
     parts.push({ inline_data: { mime_type: roomImg.mimeType, data: roomImg.data } });
@@ -103,7 +131,7 @@ app.post("/generate", async (req, res) => {
 
         if (r.ok && r.json) {
           const img = findImage(r.json);
-          if (img) return res.json({ image: img, model });
+          if (img) return res.json({ image: img, model, mode });
           attempts.push({ model, gc: gc ? gc.responseModalities.join("+") : "none", status: r.status, note: "sin imagen", sample: r.text.slice(0, 220) });
         } else {
           attempts.push({ model, gc: gc ? gc.responseModalities.join("+") : "none", status: r.status, sample: r.text.slice(0, 220) });
@@ -132,7 +160,7 @@ app.get("/diag", async (_req, res) => {
   }
 });
 
-app.get("/", (_req, res) => res.send("DecoView AI backend OK (v4)"));
+app.get("/", (_req, res) => res.send("DecoView AI backend OK (v6)"));
 
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log(`DecoView AI backend v4 escuchando en el puerto ${PORT}`));
+app.listen(PORT, () => console.log(`DecoView AI backend v6 escuchando en el puerto ${PORT}`));
