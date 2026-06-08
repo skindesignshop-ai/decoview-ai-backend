@@ -1,0 +1,16 @@
+{
+  "name": "decoview-ai-backend",
+  "version": "1.0.0",
+  "main": "decoview-ai-backend.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node decoview-ai-backend.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "cors": "^2.8.5"
+  }
+}
