@@ -1,11 +1,24 @@
 /**
  * ============================================================
- *  DecoView AI - Backend para Gemini (Nano Banana)  v6
+ *  DecoView AI - Backend  v7
  *  decodesign studio pro
  * ============================================================
- *  v6: DOS MODOS en un solo backend.
- *      mode = "exacto"      -> pone SOLO los muebles dados (Con mis muebles)
- *      mode = "inspiracion" -> ambienta y propone decoracion (Ideas)
+ *  v7: IA (2 modos) + conexion con Tiendanube (solo lectura).
+ *
+ *  Variables de entorno necesarias en Render:
+ *    GEMINI_API_KEY          -> clave de Gemini (ya la tenes)
+ *    TIENDANUBE_APP_ID       -> 33841
+ *    TIENDANUBE_CLIENT_SECRET-> el client secret de tu app
+ *    TIENDANUBE_STORE_ID     -> (se completa solo al instalar)
+ *    TIENDANUBE_TOKEN        -> (se completa solo al instalar)
+ *
+ *  Endpoints:
+ *    POST /generate              -> genera imagen con IA (modos exacto/inspiracion)
+ *    GET  /tiendanube/callback   -> recibe la instalacion de la app
+ *    GET  /productos             -> lista productos (con ?categoria= y ?q= y ?page=)
+ *    GET  /categorias            -> lista categorias
+ *    GET  /diag                  -> modelos de imagen disponibles
+ *    GET  /tiendanube/estado     -> dice si la tienda esta conectada
  */
 
 const express = require("express");
@@ -17,6 +30,18 @@ app.use(cors({ origin: "*" }));
 
 const API_KEY = process.env.GEMINI_API_KEY;
 
+// ---- Tiendanube ----
+const TN_APP_ID = process.env.TIENDANUBE_APP_ID;
+const TN_SECRET = process.env.TIENDANUBE_CLIENT_SECRET;
+// Estos dos se obtienen al instalar la app. Se pueden fijar luego como env vars.
+let TN_STORE_ID = process.env.TIENDANUBE_STORE_ID || null;
+let TN_TOKEN = process.env.TIENDANUBE_TOKEN || null;
+const TN_API = "https://api.tiendanube.com/v1";
+const TN_UA = "DecoView Visualizador (decodesign)";
+
+// ============================================================
+//  GEMINI (igual que v6)
+// ============================================================
 const MODELS = [
   "gemini-3.1-flash-image",
   "gemini-2.5-flash-image",
@@ -68,7 +93,6 @@ function buildInstruction(mode, count, prompt) {
   const base =
     "Sos un motor de edicion de imagenes de interiorismo fotorrealista. " +
     "Toma la PRIMERA imagen (la foto real del ambiente). ";
-
   let core;
   if (mode === "inspiracion") {
     core =
@@ -88,23 +112,17 @@ function buildInstruction(mode, count, prompt) {
       "REGLA IMPORTANTE: NO agregues, inventes ni sumes NINGUN otro mueble, objeto, alfombra, planta, mesa ni decoracion que no este en las imagenes provistas. " +
       "Coloca exactamente los muebles dados, ni mas ni menos. ";
   }
-
   const common =
     "Recorta cada mueble de su fondo (sin recuadro ni fondo blanco), apoyalos en el piso con la perspectiva correcta del ambiente, " +
     "escala realista, la misma iluminacion de la escena y sombra de contacto natural. " +
     "No cambies paredes, ventanas, piso ni estructura del ambiente. Devolve SOLO la imagen final integrada. ";
-
-  const userPrompt = prompt
-    ? ("Indicacion de ubicacion del cliente (respetala): " + prompt)
-    : "";
-
+  const userPrompt = prompt ? ("Indicacion de ubicacion del cliente (respetala): " + prompt) : "";
   return base + core + common + userPrompt;
 }
 
 app.post("/generate", async (req, res) => {
   try {
     if (!API_KEY) return res.status(500).json({ error: "Falta GEMINI_API_KEY." });
-
     const body = req.body || {};
     const room = body.room;
     const mode = body.mode === "inspiracion" ? "inspiracion" : "exacto";
@@ -113,11 +131,9 @@ app.post("/generate", async (req, res) => {
 
     const roomImg = parseDataUrl(room);
     if (!roomImg) return res.status(400).json({ error: "Falta la foto del ambiente." });
-
     const prodImgs = products.map(parseDataUrl).filter(Boolean);
 
     const instruction = buildInstruction(mode, prodImgs.length, body.prompt);
-
     const parts = [{ text: instruction }];
     parts.push({ inline_data: { mime_type: roomImg.mimeType, data: roomImg.data } });
     prodImgs.forEach((p) => parts.push({ inline_data: { mime_type: p.mimeType, data: p.data } }));
@@ -128,7 +144,6 @@ app.post("/generate", async (req, res) => {
         let r;
         try { r = await callModel(model, parts, gc); }
         catch (e) { attempts.push({ model, error: String(e) }); continue; }
-
         if (r.ok && r.json) {
           const img = findImage(r.json);
           if (img) return res.json({ image: img, model, mode });
@@ -146,6 +161,103 @@ app.post("/generate", async (req, res) => {
   }
 });
 
+// ============================================================
+//  TIENDANUBE
+// ============================================================
+
+// Paso de instalacion: Tiendanube redirige aca con ?code=...
+app.get("/tiendanube/callback", async (req, res) => {
+  const code = req.query.code;
+  if (!code) return res.status(400).send("Falta el codigo de autorizacion.");
+  if (!TN_APP_ID || !TN_SECRET) {
+    return res.status(500).send("Faltan TIENDANUBE_APP_ID o TIENDANUBE_CLIENT_SECRET en el servidor.");
+  }
+  try {
+    const r = await fetch("https://www.tiendanube.com/apps/authorize/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        client_id: TN_APP_ID,
+        client_secret: TN_SECRET,
+        grant_type: "authorization_code",
+        code: code,
+      }),
+    });
+    const data = await r.json();
+    if (data && data.access_token && data.user_id) {
+      TN_TOKEN = data.access_token;
+      TN_STORE_ID = String(data.user_id);
+      return res.send(
+        "<html><body style='font-family:sans-serif;text-align:center;padding:60px'>" +
+        "<h2>✅ Tienda conectada</h2>" +
+        "<p>DecoView ya puede leer tu catalogo de Tiendanube.</p>" +
+        "<p style='color:#888'>Anota estos datos en Render para que la conexion sea permanente:</p>" +
+        "<p><b>TIENDANUBE_STORE_ID</b> = " + TN_STORE_ID + "</p>" +
+        "<p><b>TIENDANUBE_TOKEN</b> = " + TN_TOKEN + "</p>" +
+        "<p style='color:#c00'>(Guardalos en privado y no los compartas.)</p>" +
+        "</body></html>"
+      );
+    }
+    return res.status(400).json({ error: "No se pudo autorizar", detail: data });
+  } catch (e) {
+    return res.status(500).json({ error: String(e) });
+  }
+});
+
+async function tnFetch(path) {
+  if (!TN_STORE_ID || !TN_TOKEN) {
+    return { error: "Tienda no conectada. Instala la app primero." };
+  }
+  const r = await fetch(`${TN_API}/${TN_STORE_ID}${path}`, {
+    headers: {
+      "Authentication": "bearer " + TN_TOKEN,
+      "User-Agent": TN_UA,
+      "Content-Type": "application/json",
+    },
+  });
+  const text = await r.text();
+  let json = null;
+  try { json = JSON.parse(text); } catch (e) {}
+  return { ok: r.ok, status: r.status, json, text };
+}
+
+function pickName(name) {
+  if (!name) return "";
+  if (typeof name === "string") return name;
+  return name.es || name.pt || name.en || Object.values(name)[0] || "";
+}
+
+// Lista de productos simplificada para el visualizador
+app.get("/productos", async (req, res) => {
+  const cat = req.query.categoria ? `&category_id=${encodeURIComponent(req.query.categoria)}` : "";
+  const q = req.query.q ? `&q=${encodeURIComponent(req.query.q)}` : "";
+  const page = req.query.page ? parseInt(req.query.page) : 1;
+  const r = await tnFetch(`/products?per_page=30&page=${page}${cat}${q}`);
+  if (r.error) return res.status(400).json(r);
+  if (!r.ok) return res.status(r.status).json({ error: "Error Tiendanube", detail: r.text.slice(0, 300) });
+  const list = (r.json || []).map((p) => ({
+    id: p.id,
+    nombre: pickName(p.name),
+    precio: p.variants && p.variants[0] ? p.variants[0].price : null,
+    imagen: p.images && p.images[0] ? p.images[0].src : null,
+  })).filter((p) => p.imagen);
+  res.json({ productos: list, page });
+});
+
+// Lista de categorias
+app.get("/categorias", async (_req, res) => {
+  const r = await tnFetch(`/categories?per_page=200`);
+  if (r.error) return res.status(400).json(r);
+  if (!r.ok) return res.status(r.status).json({ error: "Error Tiendanube", detail: r.text.slice(0, 300) });
+  const list = (r.json || []).map((c) => ({ id: c.id, nombre: pickName(c.name) }));
+  res.json({ categorias: list });
+});
+
+app.get("/tiendanube/estado", (_req, res) => {
+  res.json({ conectada: !!(TN_STORE_ID && TN_TOKEN), store_id: TN_STORE_ID || null });
+});
+
+// ============================================================
 app.get("/diag", async (_req, res) => {
   if (!API_KEY) return res.status(500).json({ error: "Falta GEMINI_API_KEY." });
   try {
@@ -160,7 +272,7 @@ app.get("/diag", async (_req, res) => {
   }
 });
 
-app.get("/", (_req, res) => res.send("DecoView AI backend OK (v6)"));
+app.get("/", (_req, res) => res.send("DecoView AI backend OK (v7) - IA + Tiendanube"));
 
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log(`DecoView AI backend v6 escuchando en el puerto ${PORT}`));
+app.listen(PORT, () => console.log(`DecoView AI backend v7 escuchando en el puerto ${PORT}`));
