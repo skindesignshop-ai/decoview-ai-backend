@@ -133,4 +133,178 @@ async function toInlineData(item) {
       if (!r.ok) return null;
       const mime = r.headers.get("content-type") || "image/jpeg";
       const buf = Buffer.from(await r.arrayBuffer());
-      return { mime_type: mime, data: buf.
+      return { mime_type: mime, data: buf.toString("base64") };
+    } catch (e) { return null; }
+  }
+  return null;
+}
+
+// /generate ahora esta protegido por requireCredit:
+//   1) exige telefono verificado por Firebase (Authorization: Bearer <token>)
+//   2) descuenta 1 credito (3 gratis por telefono) ANTES de llamar a Gemini
+app.post("/generate", requireCredit, async (req, res) => { // <-- requireCredit agregado
+  try {
+    if (!API_KEY) return res.status(500).json({ error: "Falta GEMINI_API_KEY." });
+    const body = req.body || {};
+    const room = body.room;
+    const mode = body.mode === "inspiracion" ? "inspiracion" : "exacto";
+    let products = Array.isArray(body.products) ? body.products : [];
+    if (!products.length && body.product) products = [body.product];
+
+    const roomImg = parseDataUrl(room);
+    if (!roomImg) {
+      await refundCredit(req); // no se genero nada: devolvemos el credito
+      return res.status(400).json({ error: "Falta la foto del ambiente." });
+    }
+
+    const prodInline = [];
+    for (const it of products) {
+      const inl = await toInlineData(it);
+      if (inl) prodInline.push(inl);
+    }
+
+    const instruction = buildInstruction(mode, prodInline.length, body.prompt);
+    const parts = [{ text: instruction }];
+    parts.push({ inline_data: { mime_type: roomImg.mimeType, data: roomImg.data } });
+    prodInline.forEach((p) => parts.push({ inline_data: p }));
+
+    const attempts = [];
+    for (const model of MODELS) {
+      for (const gc of CONFIGS) {
+        let r;
+        try { r = await callModel(model, parts, gc); }
+        catch (e) { attempts.push({ model, error: String(e) }); continue; }
+        if (r.ok && r.json) {
+          const img = findImage(r.json);
+          if (img) return res.json({ image: img, model, mode });
+          attempts.push({ model, gc: gc ? gc.responseModalities.join("+") : "none", status: r.status, note: "sin imagen", sample: r.text.slice(0, 220) });
+        } else {
+          attempts.push({ model, gc: gc ? gc.responseModalities.join("+") : "none", status: r.status, sample: r.text.slice(0, 220) });
+          if (r.status === 404) break;
+        }
+      }
+    }
+    await refundCredit(req); // ningun modelo devolvio imagen: devolvemos el credito
+    return res.status(502).json({ error: "Ningun modelo devolvio imagen.", attempts });
+  } catch (err) {
+    console.error(err);
+    await refundCredit(req); // hubo un error: devolvemos el credito
+    return res.status(500).json({ error: "Error interno", detail: String(err) });
+  }
+});
+
+// ============================================================
+//  TIENDANUBE
+// ============================================================
+
+// Paso de instalacion: Tiendanube redirige aca con ?code=...
+app.get("/tiendanube/callback", async (req, res) => {
+  const code = req.query.code;
+  if (!code) return res.status(400).send("Falta el codigo de autorizacion.");
+  if (!TN_APP_ID || !TN_SECRET) {
+    return res.status(500).send("Faltan TIENDANUBE_APP_ID o TIENDANUBE_CLIENT_SECRET en el servidor.");
+  }
+  try {
+    const r = await fetch("https://www.tiendanube.com/apps/authorize/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        client_id: TN_APP_ID,
+        client_secret: TN_SECRET,
+        grant_type: "authorization_code",
+        code: code,
+      }),
+    });
+    const data = await r.json();
+    if (data && data.access_token && data.user_id) {
+      TN_TOKEN = data.access_token;
+      TN_STORE_ID = String(data.user_id);
+      return res.send(
+        "<html><body style='font-family:sans-serif;text-align:center;padding:60px'>" +
+        "<h2>✅ Tienda conectada</h2>" +
+        "<p>DecoView ya puede leer tu catalogo de Tiendanube.</p>" +
+        "<p style='color:#888'>Anota estos datos en Render para que la conexion sea permanente:</p>" +
+        "<p><b>TIENDANUBE_STORE_ID</b> = " + TN_STORE_ID + "</p>" +
+        "<p><b>TIENDANUBE_TOKEN</b> = " + TN_TOKEN + "</p>" +
+        "<p style='color:#c00'>(Guardalos en privado y no los compartas.)</p>" +
+        "</body></html>"
+      );
+    }
+    return res.status(400).json({ error: "No se pudo autorizar", detail: data });
+  } catch (e) {
+    return res.status(500).json({ error: String(e) });
+  }
+});
+
+async function tnFetch(path) {
+  if (!TN_STORE_ID || !TN_TOKEN) {
+    return { error: "Tienda no conectada. Instala la app primero." };
+  }
+  const r = await fetch(`${TN_API}/${TN_STORE_ID}${path}`, {
+    headers: {
+      "Authentication": "bearer " + TN_TOKEN,
+      "User-Agent": TN_UA,
+      "Content-Type": "application/json",
+    },
+  });
+  const text = await r.text();
+  let json = null;
+  try { json = JSON.parse(text); } catch (e) {}
+  return { ok: r.ok, status: r.status, json, text };
+}
+
+function pickName(name) {
+  if (!name) return "";
+  if (typeof name === "string") return name;
+  return name.es || name.pt || name.en || Object.values(name)[0] || "";
+}
+
+// Lista de productos simplificada para el visualizador
+app.get("/productos", async (req, res) => {
+  const cat = req.query.categoria ? `&category_id=${encodeURIComponent(req.query.categoria)}` : "";
+  const q = req.query.q ? `&q=${encodeURIComponent(req.query.q)}` : "";
+  const page = req.query.page ? parseInt(req.query.page) : 1;
+  const r = await tnFetch(`/products?per_page=30&page=${page}${cat}${q}`);
+  if (r.error) return res.status(400).json(r);
+  if (!r.ok) return res.status(r.status).json({ error: "Error Tiendanube", detail: r.text.slice(0, 300) });
+  const list = (r.json || []).map((p) => ({
+    id: p.id,
+    nombre: pickName(p.name),
+    precio: p.variants && p.variants[0] ? p.variants[0].price : null,
+    imagen: p.images && p.images[0] ? p.images[0].src : null,
+  })).filter((p) => p.imagen);
+  res.json({ productos: list, page });
+});
+
+// Lista de categorias
+app.get("/categorias", async (_req, res) => {
+  const r = await tnFetch(`/categories?per_page=200`);
+  if (r.error) return res.status(400).json(r);
+  if (!r.ok) return res.status(r.status).json({ error: "Error Tiendanube", detail: r.text.slice(0, 300) });
+  const list = (r.json || []).map((c) => ({ id: c.id, nombre: pickName(c.name) }));
+  res.json({ categorias: list });
+});
+
+app.get("/tiendanube/estado", (_req, res) => {
+  res.json({ conectada: !!(TN_STORE_ID && TN_TOKEN), store_id: TN_STORE_ID || null });
+});
+
+// ============================================================
+app.get("/diag", async (_req, res) => {
+  if (!API_KEY) return res.status(500).json({ error: "Falta GEMINI_API_KEY." });
+  try {
+    const r = await fetch("https://generativelanguage.googleapis.com/v1beta/models", {
+      headers: { "x-goog-api-key": API_KEY },
+    });
+    const data = await r.json();
+    const all = (data.models || []).map((m) => m.name);
+    res.json({ ok: r.ok, modelos_de_imagen: all.filter((n) => /image/i.test(n)) });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+app.get("/", (_req, res) => res.send("DecoView AI backend OK (v10) - IA + Tiendanube + creditos"));
+
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, () => console.log(`DecoView AI backend v10 escuchando en el puerto ${PORT}`));
